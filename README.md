@@ -44,3 +44,9 @@ This way, Android runs as if it were booting normally, but inside a controlled c
 Add to kernel command line:
 ```bash
 init=/rdinit
+```
+
+---
+
+## License
+This program is released under LGPL.
