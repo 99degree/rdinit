@@ -18,7 +18,8 @@
 #include <sys/un.h>
 
 #define MAX_ARGS   64
-#define SOCK_PATH  "/dev/nssu.sock"
+#define DEFAULT_SOCK_PATH  "/dev/nssu.sock"
+#define MAX_SOCK_PATH 108  // Linux AF_UNIX path limit
 
 // TLV tags
 #define TLV_TAG      0x01
@@ -34,6 +35,44 @@
 
 int debug_mode = 0;
 int init_child = 1; // Android init PID
+
+// ---------- filesystem abstraction ----------
+// Global socket path configuration - can be customized at runtime
+static char g_sock_path[MAX_SOCK_PATH] = DEFAULT_SOCK_PATH;
+
+// Set the socket file path for communication
+void set_socket_path(const char *path) {
+    if (path && strlen(path) < MAX_SOCK_PATH) {
+        strncpy(g_sock_path, path, MAX_SOCK_PATH - 1);
+        g_sock_path[MAX_SOCK_PATH - 1] = '\0';
+    }
+}
+
+// Get the current socket file path
+const char* get_socket_path(void) {
+    return g_sock_path;
+}
+
+// Create/prepare the socket file
+static int create_socket_file(void) {
+    const char *sock_path = get_socket_path();
+    // Ensure parent directory exists
+    char path_copy[MAX_SOCK_PATH];
+    strncpy(path_copy, sock_path, MAX_SOCK_PATH - 1);
+    path_copy[MAX_SOCK_PATH - 1] = '\0';
+    
+    char *dir = dirname(path_copy);
+    if (dir && mkdir(dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir socket parent dir");
+        return -1;
+    }
+    return 0;
+}
+
+// Remove the socket file (cleanup)
+static void remove_socket_file(void) {
+    unlink(get_socket_path());
+}
 
 // ---------- helpers ----------
 static void setup_filesystems(int use_devtmpfs) {
@@ -90,6 +129,7 @@ static char *recv_tlv(int sock, uint8_t *out_type) {
     if (out_type) *out_type = type;
     return buf;
 }
+
 // ---------- proxy socket loop ----------
 void proxy_loop(void) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -100,8 +140,11 @@ void proxy_loop(void) {
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, SOCK_PATH);
-    unlink(addr.sun_path);
+    strncpy(addr.sun_path, get_socket_path(), sizeof(addr.sun_path) - 1);
+    addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+    
+    remove_socket_file();
+    
     if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         exit(1);
@@ -216,7 +259,9 @@ pid_t sock_send_request(const char *tag,
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, SOCK_PATH);
+    strncpy(addr.sun_path, get_socket_path(), sizeof(addr.sun_path) - 1);
+    addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+    
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("connect");
         close(sock);
@@ -236,9 +281,11 @@ pid_t sock_send_request(const char *tag,
     close(sock);
     return child;
 }
+
 // ---------- main_rdinit ----------
 int main_rdinit(void) {
     fprintf(stderr, "rdinit proxy starting...\n");
+    fprintf(stderr, "using socket path: %s\n", get_socket_path());
 
     // Parent sets up devtmpfs baseline
     setup_filesystems(1);
@@ -253,7 +300,7 @@ int main_rdinit(void) {
     // Wait until proxy socket is ready (retry instead of fixed sleep)
     int retries = 10;
     while (retries-- > 0) {
-        if (access(SOCK_PATH, F_OK) == 0) break;
+        if (access(get_socket_path(), F_OK) == 0) break;
         usleep(100000); // 100ms
     }
 
@@ -274,8 +321,13 @@ int main(int argc, char *argv[]) {
     const char *execname = strrchr(argv[0], '/');
     execname = execname ? execname + 1 : argv[0];
 
-    for (int i = 1; i < argc; ++i)
-        if (strcmp(argv[i], "--debug") == 0) debug_mode = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--debug") == 0) {
+            debug_mode = 1;
+        } else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
+            set_socket_path(argv[++i]);
+        }
+    }
 
     if (strcmp(execname, "rdinit") == 0) {
         // Only run rdinit logic if PID == 1 (init) or debug mode enabled
