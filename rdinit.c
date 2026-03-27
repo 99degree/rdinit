@@ -37,10 +37,11 @@
 #define MODE_NS_CHROOT_DEVTMPFS  4
 
 int debug_mode = 0;
-int init_child = 1;
-
+int init_child = -1;
 static int log_enabled = 1;
 static __thread const char *log_prefix = NULL;
+
+pid_t spawn_common(int mode,const char *newroot,const char *oldroot,char **argv);
 
 void set_log_prefix(const char *prefix) { log_prefix = prefix; }
 
@@ -56,36 +57,7 @@ static void log_msg(const char *fmt, ...) {
 }
 #define LOG(...) log_msg(__VA_ARGS__)
 
-static void setup_filesystems(int use_devtmpfs) {
-    if (debug_mode) {
-        LOG("debug_mode enabled: forcing tmpfs for /dev");
-        use_devtmpfs = 0;
-    }
-    LOG("setup_filesystems begin (use_devtmpfs=%d)", use_devtmpfs);
-    if (mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV, "") < 0 && errno != EBUSY)
-        perror("mount /proc");
-    if (mount("sysfs", "/sys", "sysfs", MS_NOEXEC|MS_NOSUID|MS_NODEV, "") < 0 && errno != EBUSY)
-        perror("mount /sys");
-
-    if (use_devtmpfs) {
-        LOG("mounting devtmpfs");
-        if (mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755") < 0 && errno != EBUSY)
-            perror("mount devtmpfs");
-    } else {
-        LOG("mounting tmpfs for /dev");
-        if (mount("tmpfs", "/dev", "tmpfs", 0, "mode=0755,size=64M") < 0 && errno != EBUSY)
-            perror("mount tmpfs /dev");
-        mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3));
-        mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5));
-        mknod("/dev/full",    S_IFCHR | 0666, makedev(1, 7));
-        mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8));
-        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
-        mknod("/dev/tty",     S_IFCHR | 0666, makedev(5, 0));
-        mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1));
-    }
-    LOG("setup_filesystems done");
-}
-
+// ---------- signals ----------
 static void sigchld_handler(int sig) {
     (void)sig;
     int status;
@@ -98,18 +70,36 @@ static void sigchld_handler(int sig) {
     }
 }
 
-// TLV helpers
+// ---------- filesystem setup ----------
+static void setup_filesystems(int use_devtmpfs) {
+    if (debug_mode) {
+        LOG("debug_mode enabled: forcing tmpfs for /dev");
+        use_devtmpfs = 0;
+    }
+    mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV, "");
+    mount("sysfs", "/sys", "sysfs", MS_NOEXEC|MS_NOSUID|MS_NODEV, "");
+    if (use_devtmpfs) {
+        mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755");
+    } else {
+        mount("tmpfs", "/dev", "tmpfs", 0, "mode=0755,size=64M");
+        mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3));
+        mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5));
+        mknod("/dev/full",    S_IFCHR | 0666, makedev(1, 7));
+        mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8));
+        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
+        mknod("/dev/tty",     S_IFCHR | 0666, makedev(5, 0));
+        mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1));
+    }
+}
+
+// ---------- TLV helpers ----------
 static ssize_t write_all(int fd, const void *buf, size_t len) {
     const uint8_t *p = buf;
     size_t left = len;
     while (left) {
         ssize_t w = write(fd, p, left);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        left -= w;
-        p += w;
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        left -= w; p += w;
     }
     return len;
 }
@@ -119,13 +109,9 @@ static ssize_t read_all(int fd, void *buf, size_t len) {
     size_t left = len;
     while (left) {
         ssize_t r = read(fd, p, left);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
         if (r == 0) return (ssize_t)(len - left);
-        left -= r;
-        p += r;
+        left -= r; p += r;
     }
     return len;
 }
@@ -138,8 +124,7 @@ static void send_tlv(int sock, uint8_t type, const char *val) {
 }
 
 static char *recv_tlv(int sock, uint8_t *out_type) {
-    uint8_t type;
-    uint16_t len;
+    uint8_t type; uint16_t len;
     if (read_all(sock, &type, 1) != 1) return NULL;
     if (read_all(sock, &len, 2) != 2) return NULL;
     char *buf = malloc(len+1);
@@ -166,16 +151,13 @@ void proxy_loop(void) {
     size_t name_len = strlen(ABSTRACT_SOCK_NAME);
     addr.sun_path[0] = '\0';
     memcpy(&addr.sun_path[1], ABSTRACT_SOCK_NAME, name_len);
-    socklen_t bind_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+    socklen_t bind_len = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
 
-    LOG("binding abstract socket");
     if (bind(sock, (struct sockaddr*)&addr, bind_len) < 0) {
         perror("bind (abstract)");
         close(sock);
         return;
     }
-
-    LOG("listening");
     if (listen(sock, 5) < 0) {
         perror("listen");
         close(sock);
@@ -183,61 +165,69 @@ void proxy_loop(void) {
     }
 
     while (1) {
-        LOG("waiting for client");
         int client = accept(sock, NULL, NULL);
-        if (client < 0) {
-            if (errno == EINTR) continue;
-            perror("accept");
-            continue;
+        if (client < 0) { if (errno == EINTR) continue; continue; }
+
+        char *tag=NULL,*newroot=NULL,*oldroot=NULL,*argv[MAX_ARGS]; int argc=0;
+        uint8_t type;
+        while (1) {
+            char *val = recv_tlv(client,&type);
+            if (!val) break;
+            switch(type){
+                case TLV_TAG: tag=val; break;
+                case TLV_NEWROOT: newroot=val; break;
+                case TLV_OLDROOT: oldroot=val; break;
+                case TLV_ARG: if(argc<MAX_ARGS-1) argv[argc++]=val; break;
+                default: free(val); break;
+            }
         }
-        LOG("accepted client");
+        argv[argc]=NULL;
 
-        // TODO: implement TLV request handling here
-        // Example: recv_tlv(), call spawn_common(), send back child PID
+        int mode=-1;
+        if(tag){
+            if(strcmp(tag,"NS_SU")==0) mode=MODE_NS_SU;
+            else if(strcmp(tag,"NS_CHROOT")==0) mode=MODE_NS_CHROOT;
+            else if(strcmp(tag,"NS_CHROOT_DEVTMPFS")==0) mode=MODE_NS_CHROOT_DEVTMPFS;
+            else if(strcmp(tag,"PROXY")==0) mode=MODE_PROXY;
+        }
 
+        pid_t child=-EINVAL;
+        if(mode>0) child=spawn_common(mode,newroot,oldroot,argv);
+        write_all(client,&child,sizeof(child));
+
+        free(tag); free(newroot); free(oldroot);
+        for(int i=0;i<argc;i++) free(argv[i]);
         close(client);
     }
 }
 
 // ---------- spawn_common ----------
 static int file_exists(const char *path) {
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+    struct stat st; return (stat(path,&st)==0 && S_ISREG(st.st_mode));
 }
 
-pid_t spawn_common(int mode, const char *newroot, const char *oldroot, char **argv) {
-    LOG("spawn_common mode=%d", mode);
+pid_t spawn_common(int mode,const char *newroot,const char *oldroot,char **argv){
+    if(argv && argv[0] && !file_exists(argv[0])) return -ENOENT;
 
-    if (argv && argv[0] && !file_exists(argv[0])) {
-        LOG("exec file %s not found", argv[0]);
-        return -ENOENT;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return -1;
-    }
-
-    if (pid == 0) {
+    pid_t pid=fork();
+    if(pid<0) return -1;
+    if(pid==0){
         set_log_prefix("child");
-        switch (mode) {
-        case MODE_PROXY:
-            if (unshare(CLONE_NEWNS) < 0) return -1;
-            setup_filesystems(0);
-            proxy_loop();
-            return 0;
-        case MODE_NS_SU:
-            execvp(argv[0], argv);
-            return -ENOENT;
-        case MODE_NS_CHROOT:
-        case MODE_NS_CHROOT_DEVTMPFS:
-            if (chdir(newroot) < 0) return -1;
-            if (chroot(newroot) < 0) return -1;
-            execvp(argv[0], argv);
-            return -ENOENT;
-        default:
-            return -EINVAL;
+        switch(mode){
+            case MODE_PROXY:
+                if(unshare(CLONE_NEWNS)<0) exit(1);
+                if(mount(NULL,"/",NULL,MS_REC|MS_PRIVATE,NULL)<0) exit(1);
+                setup_filesystems(0);
+                proxy_loop(); exit(0);
+            case MODE_NS_SU:
+                execvp(argv[0],argv); exit(127);
+            case MODE_NS_CHROOT:
+            case MODE_NS_CHROOT_DEVTMPFS:
+                if(chdir(newroot)<0) exit(1);
+                if(chroot(newroot)<0) exit(1);
+                execvp(argv[0],argv); exit(127);
+            default:
+                exit(1);
         }
     }
     return pid;
@@ -250,11 +240,8 @@ pid_t sock_send_request(const char *tag,
                         char **argv,
                         int argc)
 {
-    LOG("sock_send_request tag=%s newroot=%s oldroot=%s argc=%d",
-        tag, newroot ? newroot : "(null)", oldroot ? oldroot : "(null)", argc);
-
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("socket"); return -1; }
+    if (sock < 0) return -1;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -262,12 +249,10 @@ pid_t sock_send_request(const char *tag,
     size_t name_len = strlen(ABSTRACT_SOCK_NAME);
     addr.sun_path[0] = '\0';
     memcpy(&addr.sun_path[1], ABSTRACT_SOCK_NAME, name_len);
-    socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
 
     if (connect(sock, (struct sockaddr*)&addr, addr_len) < 0) {
-        perror("connect (abstract)");
-        close(sock);
-        return -1;
+        close(sock); return -1;
     }
 
     send_tlv(sock, TLV_TAG, tag);
@@ -275,42 +260,37 @@ pid_t sock_send_request(const char *tag,
     if (oldroot) send_tlv(sock, TLV_OLDROOT, oldroot);
     for (int i = 0; i < argc; i++) send_tlv(sock, TLV_ARG, argv[i]);
 
-    pid_t child = -1;
-    if (read_all(sock, &child, sizeof(child)) != sizeof(child)) {
-        perror("read child pid");
-        child = -1;
-    }
+    pid_t child=-1;
+    if(read_all(sock,&child,sizeof(child))!=sizeof(child)) child=-1;
     close(sock);
-    LOG("sock_send_request returning child pid=%d", child);
     return child;
 }
 // ---------- main_rdinit ----------
 int main_rdinit(int argc, char **argv) {
     set_log_prefix("rdinit");
+
+    // Handle --help
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            printf("Usage: rdinit [options] [init_binary [args...]]\n\n");
+            printf("Options:\n");
+            printf("  --help       Show this help message\n");
+            printf("  --debug      Enable debug logging\n");
+            printf("  --quiet      Disable logging\n\n");
+            printf("If no init_binary is specified, defaults to /init.\n");
+            return 0;
+        }
+    }
+
     LOG("rdinit proxy starting...");
 
-    if (unshare(CLONE_NEWNS) < 0) {
-        perror("unshare(CLONE_NEWNS)");
-        return 1;
-    }
-    LOG("unshare succeeded");
-
-    // Make root mount private so changes don’t propagate back
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
-        perror("mount --make-rprivate /");
-        return 1;
-    }
-    LOG("mount propagation set to private");
+    if (unshare(CLONE_NEWNS) < 0) { perror("unshare(CLONE_NEWNS)"); return 1; }
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) { perror("mount --make-rprivate /"); return 1; }
 
     setup_filesystems(1);
 
     pid_t proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL);
-    if (proxy < 0) {
-        fprintf(stderr, "spawn proxy failed\n");
-        return 1;
-    }
-    LOG("proxy child pid=%d", proxy);
-
+    if (proxy < 0) { fprintf(stderr, "spawn proxy failed\n"); return 1; }
     signal(SIGCHLD, sigchld_handler);
 
     // Wait until proxy socket is ready
@@ -318,85 +298,60 @@ int main_rdinit(int argc, char **argv) {
     while (retries-- > 0) {
         int s = socket(AF_UNIX, SOCK_STREAM, 0);
         if (s >= 0) {
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
+            struct sockaddr_un addr; memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
             size_t name_len = strlen(ABSTRACT_SOCK_NAME);
             addr.sun_path[0] = '\0';
             memcpy(&addr.sun_path[1], ABSTRACT_SOCK_NAME, name_len);
-            socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
-            if (connect(s, (struct sockaddr*)&addr, addr_len) == 0) {
-                close(s);
-                break;
-            }
+            socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
+            if (connect(s, (struct sockaddr*)&addr, addr_len) == 0) { close(s); break; }
             close(s);
         }
         usleep(100000);
     }
 
-    // Default to /init if no argument provided
     char *init_path = (argc > 1) ? argv[1] : "/init";
-    char *child_argv[MAX_ARGS];
-    int n = 0;
+    char *child_argv[MAX_ARGS]; int n = 0;
     child_argv[n++] = init_path;
-    for (int i = 2; i < argc && n < MAX_ARGS - 1; i++) {
-        child_argv[n++] = argv[i];
-    }
+    for (int i = 2; i < argc && n < MAX_ARGS - 1; i++) child_argv[n++] = argv[i];
     child_argv[n] = NULL;
 
     pid_t child = sock_send_request("NS_CHROOT_DEVTMPFS", "/", "oldroot", child_argv, n);
-    if (child < 0) {
-        fprintf(stderr, "sock_send_request failed for %s\n", init_path);
-        return 1;
-    }
+    if (child < 0) { fprintf(stderr, "sock_send_request failed for %s\n", init_path); return 1; }
     init_child = child;
-    LOG("spawned init pid=%d", init_child);
 
-    // Properly reap children
     while (1) {
-        int status;
-        pid_t pid = waitpid(-1, &status, 0);
-        if (pid < 0) {
-            if (errno == EINTR) continue;
-            perror("waitpid");
-            break;
-        }
-        if (WIFEXITED(status))
-            LOG("child %d exited code=%d", pid, WEXITSTATUS(status));
-        else if (WIFSIGNALED(status))
-            LOG("child %d killed signal=%d (%s)", pid, WTERMSIG(status), strsignal(WTERMSIG(status)));
+        int status; pid_t pid = waitpid(-1, &status, 0);
+        if (pid < 0) { if (errno == EINTR) continue; perror("waitpid"); break; }
+        if (WIFEXITED(status)) LOG("child %d exited code=%d", pid, WEXITSTATUS(status));
+        else if (WIFSIGNALED(status)) LOG("child %d killed signal=%d (%s)", pid, WTERMSIG(status), strsignal(WTERMSIG(status)));
     }
-
     return 0;
 }
 
 // ---------- main_ns_su ----------
 int main_ns_su(int argc, char *argv[]) {
     set_log_prefix("ns-su");
-    LOG("ns-su starting...");
 
-    if (argc < 2) {
-        fprintf(stderr,"Usage: ns-su <binary> [args...]\n");
-        return 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            printf("Usage: ns-su [options] <binary> [args...]\n\n");
+            printf("Options:\n");
+            printf("  --help       Show this help message\n");
+            printf("  --debug      Enable debug logging\n");
+            printf("  --quiet      Disable logging\n\n");
+            return 0;
+        }
     }
 
-    char *child_argv[MAX_ARGS]; 
-    int n = 0;
-    for (int i = 1; i < argc && n < MAX_ARGS - 1; i++) {
-        child_argv[n++] = argv[i];
-    }
+    if (argc < 2) { fprintf(stderr,"Usage: ns-su <binary> [args...]\n"); return 1; }
+
+    char *child_argv[MAX_ARGS]; int n = 0;
+    for (int i = 1; i < argc && n < MAX_ARGS - 1; i++) child_argv[n++] = argv[i];
     child_argv[n] = NULL;
 
     pid_t child = sock_send_request("NS_SU", NULL, NULL, child_argv, n);
-    if (child < 0) {
-        if (child == -ENOENT)
-            fprintf(stderr, "ns-su: exec file not found\n");
-        else if (child == -EINVAL)
-            fprintf(stderr, "ns-su: invalid mode\n");
-        else
-            fprintf(stderr, "ns-su: spawn_common failed\n");
-        return 1;
-    }
+    if (child < 0) { fprintf(stderr, "ns-su failed\n"); return 1; }
 
     printf("Proxy spawned ns-su pid=%d\n", child);
     return 0;
@@ -405,47 +360,61 @@ int main_ns_su(int argc, char *argv[]) {
 // ---------- main_ns_chroot ----------
 int main_ns_chroot(int argc, char *argv[]) {
     set_log_prefix("ns-chroot");
-    LOG("ns-chroot starting...");
 
-    if (argc < 3) {
-        fprintf(stderr,"Usage: ns-chroot <root> <binary> [args...]\n");
-        return 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            printf("Usage: ns-chroot [options] <root> <binary> [args...]\n\n");
+            printf("Options:\n");
+            printf("  --help       Show this help message\n");
+            printf("  --debug      Enable debug logging\n");
+            printf("  --quiet      Disable logging\n\n");
+            return 0;
+        }
     }
 
-    char *child_argv[MAX_ARGS]; 
-    int n = 0;
-    for (int i = 2; i < argc && n < MAX_ARGS - 1; i++) {
-        child_argv[n++] = argv[i];
-    }
+    if (argc < 3) { fprintf(stderr,"Usage: ns-chroot <root> <binary> [args...]\n"); return 1; }
+
+    char *child_argv[MAX_ARGS]; int n = 0;
+    for (int i = 2; i < argc && n < MAX_ARGS - 1; i++) child_argv[n++] = argv[i];
     child_argv[n] = NULL;
 
     pid_t child = sock_send_request("NS_CHROOT", argv[1], "oldroot", child_argv, n);
-    if (child < 0) {
-        if (child == -ENOENT)
-            fprintf(stderr, "ns-chroot: exec file not found\n");
-        else if (child == -EINVAL)
-            fprintf(stderr, "ns-chroot: invalid mode\n");
-        else
-            fprintf(stderr, "ns-chroot: spawn_common failed\n");
-        return 1;
-    }
+    if (child < 0) { fprintf(stderr, "ns-chroot failed\n"); return 1; }
 
     printf("Proxy spawned ns-chroot pid=%d\n", child);
     return 0;
 }
-
 // ---------- dispatcher ----------
 int main(int argc, char *argv[]) {
     const char *execname = strrchr(argv[0], '/');
     execname = execname ? execname + 1 : argv[0];
 
+    // Global options
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--debug") == 0) debug_mode = 1;
         if (strcmp(argv[i], "--quiet") == 0) log_enabled = 0;
+        if (strcmp(argv[i], "--help") == 0) {
+            printf("Supported subcommands:\n");
+            printf("  rdinit     - start proxy and spawn init (/init by default)\n");
+            printf("  ns-su      - run a binary inside proxy namespace\n");
+            printf("  ns-chroot  - run a binary inside a chroot namespace\n\n");
+            printf("You can invoke directly (e.g. 'ns-su') or via rdinit:\n");
+            printf("  rdinit ns-su <binary> [args...]\n");
+            printf("  rdinit ns-chroot <root> <binary> [args...]\n");
+            return 0;
+        }
     }
 
+    // Normal invocation by binary name
     if (strcmp(execname, "rdinit") == 0) {
-        return main_rdinit(argc, argv);
+        // Check if rdinit is being used as a front-end for subcommands
+        if (argc > 1 && strcmp(argv[1], "ns-su") == 0) {
+            return main_ns_su(argc - 1, argv + 1);
+        } else if (argc > 1 && strcmp(argv[1], "ns-chroot") == 0) {
+            return main_ns_chroot(argc - 1, argv + 1);
+        } else {
+            return main_rdinit(argc, argv);
+        }
     } else if (strcmp(execname, "ns-su") == 0) {
         return main_ns_su(argc, argv);
     } else if (strcmp(execname, "ns-chroot") == 0) {
@@ -453,6 +422,7 @@ int main(int argc, char *argv[]) {
     } else {
         set_log_prefix("unknown");
         LOG("unknown invocation %s", execname);
+        fprintf(stderr, "Supported subcommands: rdinit, ns-su, ns-chroot\n");
         return 1;
     }
 }
