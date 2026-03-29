@@ -82,6 +82,23 @@ static void sigchld_handler(int sig) {
     }
 }
 
+static void setup_console(void) {
+int fd = open("/dev/console", O_WRONLY);
+if (fd >= 0) {
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+}
+setvbuf(stdout, NULL, _IONBF, 0);  // disable buffering
+setvbuf(stderr, NULL, _IONBF, 0);
+
+kmsg_fd = open("/dev/kmsg", O_WRONLY);
+if (kmsg_fd >= 0) {
+    int flags = fcntl(kmsg_fd, F_GETFD);
+    fcntl(kmsg_fd, F_SETFD, flags | FD_CLOEXEC);
+    dprintf(kmsg_fd, "<6>[xxx] kmsg logging enabled\n");
+}
+}
 // ---------- filesystem setup ----------
 static void setup_filesystems(int use_devtmpfs) {
     if (debug_mode) {
@@ -89,7 +106,8 @@ static void setup_filesystems(int use_devtmpfs) {
         use_devtmpfs = 0;
     }
     mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV, "");
-    mount("sysfs", "/sys", "sysfs", MS_NOEXEC|MS_NOSUID|MS_NODEV, "");
+     // There is complain about /sys busy so don't mount it.
+    //mount("sysfs", "/sys", "sysfs", MS_NOEXEC|MS_NOSUID|MS_NODEV, "");
     if (use_devtmpfs) {
         mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755");
     } else {
@@ -241,6 +259,35 @@ static int file_exists(const char *path) {
     return (stat(path,&st)==0 && S_ISREG(st.st_mode));
 }
 
+#include <dirent.h>
+
+static void list_dir_recursive(const char *path) {
+    int cnt = 20;
+    DIR *d = opendir(path);
+    if (!d) {
+        LOG("cannot open %s: %s", path, strerror(errno));
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+
+        char fullpath[PATH_MAX];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", path, de->d_name);
+        LOG("ramdisk file: %s", fullpath);
+#if 0
+        if (de->d_type == DT_DIR) {
+            list_dir_recursive(fullpath);
+        }
+#endif
+        
+        if (cnt-- < 0) break;
+        sleep(1);
+    }
+    closedir(d);
+}
+
 pid_t spawn_common(int mode,const char *newroot,const char *oldroot,char **argv){
     LOG("%s enter", __func__);
 
@@ -254,6 +301,7 @@ pid_t spawn_common(int mode,const char *newroot,const char *oldroot,char **argv)
         return -2;
                 if(mount(NULL,"/",NULL,MS_REC|MS_PRIVATE,NULL)<0) return -3;
                 setup_filesystems(0);
+                setup_console();
                 proxy_loop(); 
                 exit(0);
             case MODE_NS_SU:
@@ -267,11 +315,33 @@ pid_t spawn_common(int mode,const char *newroot,const char *oldroot,char **argv)
                 execvp(argv[0],argv); 
                 return -4;
             case MODE_NS_CHROOT_DEVTMPFS:
+                LOG("%s %s", __func__, argv[0]);
                 // Setup filesystem here.
-                 if(unshare(CLONE_NEWNS | CLONE_NEWPID)<0) return -2;
+                 if(unshare(CLONE_NEWPID)<0) return -2;
+                LOG("%s %s after unshare", __func__, argv[0]);
+#if 0
                  // Intented to let Android mount share to proxy server.
                 //if(mount(NULL,"/",NULL,MS_REC|MS_PRIVATE,NULL)<0) return -3;
+#endif
+                LOG("%s %s after mount private", __func__, argv[0]);
                 setup_filesystems(1);
+                setup_console();
+LOG("%s %s after mount private", __func__, argv[0]);
+                // Don't know why argv shift by 1. So align to argv[1]
+                if(argv && argv[1] && !file_exists(argv[1])) {
+                        //return -ENOENT;
+                        LOG("%s file NOT exist %s %s %s", __func__, argv[0], argv[1], argv [2]);
+#if 0
+LOG("Listing ramdisk contents...");
+list_dir_recursive("/");
+LOG("Finished listing ramdisk contents");
+#endif
+                        sleep(30);
+                        _exit(-1);
+                    } else
+                        LOG("%s file exist", __func__);
+                execvp(argv[1],argv); 
+                return -5;
             case MODE_NS_CHROOT:
                 LOG("%s %s", __func__, argv[0]);
 
@@ -332,6 +402,76 @@ pid_t sock_send_request(const char *tag,
 
 int main_ns_chroot_android(int argc, char *argv[]);
 
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+
+static int resolve_path(const char *candidate, char *out, size_t outlen) {
+    struct stat st;
+    if (lstat(candidate, &st) != 0) return 0; // not found
+
+    strncpy(out, candidate, outlen - 1);
+    out[outlen - 1] = '\0';
+
+    if (S_ISLNK(st.st_mode)) {
+        char linkbuf[PATH_MAX];
+        ssize_t len = readlink(candidate, linkbuf, sizeof(linkbuf)-1);
+        if (len > 0) {
+            linkbuf[len] = '\0';
+            LOG("%s is symlink -> %s", candidate, linkbuf);
+            strncpy(out, linkbuf, outlen - 1);
+            out[outlen - 1] = '\0';
+        }
+    }
+    return 1;
+}
+static int parse_cmdline_init(char *out, size_t outlen) {
+    FILE *f = fopen("/proc/cmdline", "r");
+    if (!f) { LOG("cannot open /proc/cmdline: %s", strerror(errno)); return -1; }
+
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), f)) { LOG("failed to read /proc/cmdline"); fclose(f); return -1; }
+    fclose(f);
+
+    // Look for " init=" or start "init="
+    char *p = strstr(buf, " init=");
+    if (!p && strncmp(buf, "init=", 5) == 0) p = buf;
+    if (p) {
+        if (p[0] == ' ') p++; // skip space
+        p += 5; // skip "init="
+        char candidate[PATH_MAX];
+        size_t i = 0;
+        while (*p && *p != ' ' && i < sizeof(candidate) - 1) {
+            candidate[i++] = *p++;
+        }
+        candidate[i] = '\0';
+        if (resolve_path(candidate, out, outlen)) {
+            LOG("cmdline init= resolved: %s", out);
+            return 1;
+        }
+    }
+
+    // Fallbacks
+    const char *fallbacks[] = {
+        "/init",
+        "/system/bin/init",
+        "/sbin/init",
+        "/etc/init",
+        "/bin/init",
+        "/bin/sh"
+    };
+    for (int i = 0; i < (int)(sizeof(fallbacks)/sizeof(fallbacks[0])); i++) {
+        if (resolve_path(fallbacks[i], out, outlen)) {
+            LOG("no init=, fallback to %s", out);
+            return 2;
+        }
+    }
+
+    LOG("no init found, nothing to exec");
+    return 0;
+}
+
 // ---------- main_rdinit ----------
 int main_rdinit(int argc, char **argv) {
     set_log_prefix("rdinit");
@@ -340,7 +480,7 @@ int main_rdinit(int argc, char **argv) {
     if (unshare(CLONE_NEWNS) < 0) { perror("unshare(CLONE_NEWNS)"); return 1; }
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) { perror("make-rprivate"); return 1; }
     setup_filesystems(0);
-
+    setup_console();
     pid_t proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL);
     if (proxy < 0) { fprintf(stderr, "spawn proxy failed\n"); return 1; }
     signal(SIGCHLD, sigchld_handler);
@@ -351,26 +491,21 @@ int main_rdinit(int argc, char **argv) {
         return 0;
     }
 
-int fd = open("/dev/console", O_WRONLY);
-if (fd >= 0) {
-    dup2(fd, STDOUT_FILENO);
-    dup2(fd, STDERR_FILENO);
-    close(fd);
-}
-setvbuf(stdout, NULL, _IONBF, 0);  // disable buffering
-setvbuf(stderr, NULL, _IONBF, 0);
-
-kmsg_fd = open("/dev/kmsg", O_WRONLY);
-if (kmsg_fd >= 0) {
-    int flags = fcntl(kmsg_fd, F_GETFD);
-    fcntl(kmsg_fd, F_SETFD, flags | FD_CLOEXEC);
-    dprintf(kmsg_fd, "<6>[rdinit] kmsg logging enabled\n");
-}
-
 LOG("check if console is fine");
 
     // Otherwise, delegate to ns-chroot to create default container
     char *child_argv[MAX_ARGS]; int n = 0;
+
+    char init_path[256];
+int ret = parse_cmdline_init(init_path, sizeof(init_path));
+if (ret > 0) {
+    // Found init=, init_path contains the value
+    LOG("Using init override: %s", init_path);
+} else {
+    // No init=, fall back to default /init
+    LOG("No init override, using default /init");
+}
+
     if (argc > 1) {
         for (int i = 1; i < argc && n < MAX_ARGS - 1; i++)
             child_argv[n++] = argv[i];
@@ -379,7 +514,7 @@ LOG("check if console is fine");
         // This is the default init path
         child_argv[++n] = "ns-chroot";
         child_argv[++n] = "./";
-        child_argv[++n] = "./init";
+        child_argv[++n] = init_path; 
         child_argv[++n] = "NULL";
     }
     
@@ -399,7 +534,7 @@ LOG("check if console is fine");
     int status;
     pid_t pid;
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {}
-    sleep(400);
+    sleep(150);
     return 0;
 }
 
@@ -489,7 +624,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
-
+    
     // Normal invocation by binary name
     if (strcmp(execname, "rdinit") == 0) {
         if (argc > 1 && strcmp(argv[1], "ns-su") == 0) {
