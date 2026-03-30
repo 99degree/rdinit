@@ -469,6 +469,96 @@ loop:
     }
     return 0;
 }
+
+// child_main: bind stdio to console and exec the provided command.
+// argc/argv here are the child's arguments (argv[0] is the program to exec).
+int child_main(int argc, char **argv) {
+    // Determine console from cmdline or fallback
+    const char *tty = parse_console_from_cmdline(); // implement if not present
+    if (!tty) tty = "/dev/console";
+
+    redirect_to_console(tty);
+
+    if (argc < 1 || !argv[0]) {
+        fprintf(stderr, "child_main: no command provided\n");
+        return 1;
+    }
+
+    // Validate executable before exec
+    if (!validate_command(argv[0])) {
+        fprintf(stderr, "child_main: command not found or not executable: %s\n", argv[0]);
+        return 1;
+    }
+
+    // Exec the requested program; if exec fails, print error and exit
+    execvp(argv[0], argv);
+    fprintf(stderr, "child_main: execvp failed: %s\n", strerror(errno));
+    return 1;
+}
+
+// Run proxy as a background service. Reuse rdinit setup steps (mounts, dev nodes, kmsg).
+// Returns 0 in the parent (service started) or nonzero on failure.
+int proxy_main(int argc, char **argv) {
+    // System role: ensure logging and mounts are prepared like rdinit
+    redirect_to_kmsg();
+
+    if (setup_mounts_and_dev() != 0) {
+        fprintf(stderr, "proxy_main: setup_mounts_and_dev failed\n");
+        return 1;
+    }
+
+    // Create a socketpair for proxy loop communication
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        fprintf(stderr, "proxy_main: socketpair failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "proxy_main: fork failed: %s\n", strerror(errno));
+        close(sv[0]); close(sv[1]);
+        return 1;
+    }
+
+    if (pid > 0) {
+        // Parent: detach and return success (background service started)
+        close(sv[1]);
+
+        // Optionally write the child PID to a pidfile or log it
+        LOG_INFOF("proxy_main: started background proxy pid=%d", pid);
+
+        // Parent should close standard fds if you want it fully daemonized,
+        // but keep behavior minimal: return to caller so init can continue.
+        return 0;
+    }
+
+    // Child: become the background proxy process
+    close(sv[0]);
+
+    // Create new session and detach from controlling tty
+    if (setsid() < 0) {
+        fprintf(stderr, "proxy_main(child): setsid failed: %s\n", strerror(errno));
+        // continue anyway
+    }
+
+    // Optional: chdir to / to avoid blocking mounts
+    chdir("/");
+
+    // Close inherited file descriptors except sv[1], STDIN/OUT/ERR if needed
+    for (int fd = 3; fd < 256; fd++) {
+        if (fd != sv[1]) close(fd);
+    }
+
+    // Reuse rdinit logging behavior
+    redirect_to_kmsg();
+
+    // Run the proxy loop on the socket end
+    int rc = proxy_loop(sv[1]);
+
+    // If proxy_loop returns, exit child process
+    _exit(rc);
+}
 int main(int argc, char **argv) {
     // Debug bypass: force rdinit_main regardless of PID
     if (argc >= 2 && strcmp(argv[1], "--debug") == 0) {
@@ -509,4 +599,281 @@ int main(int argc, char **argv) {
         print_help(argv[0]);
         return 1;
     }
+}
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+
+/* Assumed existing elsewhere in the project:
+ *   int setup_mounts_and_dev(void);
+ *   int proxy_loop(int fd);
+ *   int validate_command(const char *path);
+ *   void redirect_to_kmsg(void);
+ *   void redirect_to_console(const char *path);
+ *
+ * If any of these are missing, provide minimal stubs or adapt calls.
+ */
+
+#define CMDLINE_BUFSZ 1024
+
+/* -------------------------
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+
+/* Assumed existing elsewhere in the project:
+ *   int setup_mounts_and_dev(void);
+ *   int proxy_loop(int fd);
+ *   int validate_command(const char *path);
+ *   void redirect_to_kmsg(void);
+ *   void redirect_to_console(const char *path);
+ *
+ * If any of these are missing, provide minimal stubs or adapt calls.
+ */
+
+#define CMDLINE_BUFSZ 1024
+
+/* -------------------------
+ * Common parsing utilities
+ * ------------------------- */
+
+/* Read /proc/cmdline into a bounded buffer and NUL-terminate.
+ * Guarantees the read loop writes at most CMDLINE_BUFSZ-1 bytes
+ * and sets buf[CMDLINE_BUFSZ-1] = '\0' if the input is longer.
+ */
+static void read_cmdline_buf(char *buf, size_t bufsz) {
+    FILE *f = fopen("/proc/cmdline", "r");
+    if (!f) {
+        buf[0] = '\0';
+        return;
+    }
+
+    size_t n = 0;
+    int c;
+    while (n < (bufsz - 1) && (c = fgetc(f)) != EOF) {
+        buf[n++] = (char)c;
+    }
+    /* If buffer filled, ensure we still NUL-terminate at last slot */
+    buf[n] = '\0';
+
+    /* If we stopped because buffer full, drain the rest of the stream to EOF */
+    if (c != EOF) {
+        while ((c = fgetc(f)) != EOF) { /* discard */ }
+    }
+
+    fclose(f);
+}
+
+/* Return pointer to static buffer containing the init path or NULL.
+ * Matches only the literal token " init=" (leading space).
+ * The returned pointer points to a static buffer owned by this function.
+ * Blacklists common self names to avoid self-looping.
+ */
+static const char *parse_init_param(void) {
+    static char cmdline[CMDLINE_BUFSZ];
+    read_cmdline_buf(cmdline, sizeof(cmdline));
+
+    char *pos = strstr(cmdline, " init=");
+    if (!pos) return NULL;
+
+    char *val = pos + 6; /* skip " init=" */
+    if (!*val) return NULL;
+
+    static char init_path[CMDLINE_BUFSZ];
+    size_t i = 0;
+    while (i < (sizeof(init_path) - 1) && *val && *val != ' ' && *val != '\t' && *val != '\n' && *val != '\r') {
+        init_path[i++] = *val++;
+    }
+    init_path[i] = '\0';
+
+    /* Defensive blacklist to avoid launching ourselves */
+    if (strstr(init_path, "rdinit") || strstr(init_path, "proxy") ||
+        strstr(init_path, "spawn")  || strstr(init_path, "child") ||
+        strstr(init_path, "sudo")   || strstr(init_path, "chroot")) {
+        return NULL;
+    }
+
+    return init_path;
+}
+
+/* Parse console= token using the same simple rules as parse_init_param.
+ * Matches only " console=" (leading space). Returns static buffer or NULL.
+ */
+static const char *parse_console_from_cmdline(void) {
+    static char cmdline[CMDLINE_BUFSZ];
+    read_cmdline_buf(cmdline, sizeof(cmdline));
+
+    char *pos = strstr(cmdline, " console=");
+    if (!pos) return NULL;
+
+    char *val = pos + 9; /* skip " console=" */
+    if (!*val) return NULL;
+
+    static char console_path[CMDLINE_BUFSZ];
+    size_t i = 0;
+    while (i < (sizeof(console_path) - 1) && *val && *val != ' ' && *val != '\t' && *val != '\n' && *val != '\r') {
+        console_path[i++] = *val++;
+    }
+    console_path[i] = '\0';
+
+    return console_path;
+}
+
+/* -------------------------
+ * Logging / console helpers
+ * ------------------------- */
+
+/* Redirect stdout/stderr to /dev/kmsg if available.
+ * This is non-fatal: on failure we leave stdio as-is and return -1.
+ */
+static int redirect_to_kmsg(void) {
+    int fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    if (dup2(fd, STDOUT_FILENO) < 0) { close(fd); return -1; }
+    if (dup2(fd, STDERR_FILENO) < 0) { close(fd); return -1; }
+    close(fd);
+    return 0;
+}
+
+/* Redirect stdio to a console device path (e.g., /dev/console or /dev/ttyS0).
+ * Returns 0 on success, -1 on failure.
+ */
+static int redirect_to_console(const char *path) {
+    if (!path) return -1;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    if (dup2(fd, STDIN_FILENO) < 0) { close(fd); return -1; }
+    if (dup2(fd, STDOUT_FILENO) < 0) { close(fd); return -1; }
+    if (dup2(fd, STDERR_FILENO) < 0) { close(fd); return -1; }
+
+    /* Keep fd open only if it's not one of std{in,out,err} */
+    if (fd > STDERR_FILENO) close(fd);
+    return 0;
+}
+
+/* -------------------------
+ * Background proxy service
+ * ------------------------- */
+
+/* Start proxy as a background service. This reuses rdinit setup steps
+ * (mounts/dev creation) so the proxy runs in a prepared environment.
+ *
+ * Behavior:
+ *  - Parent returns 0 on success (proxy started in background).
+ *  - Child becomes the proxy daemon and runs proxy_loop(fd).
+ *  - On failure, returns non-zero.
+ *
+ * Notes:
+ *  - setup_mounts_and_dev() must be idempotent.
+ *  - proxy_loop(int fd) is expected to take ownership of the socket fd.
+ */
+int proxy_main(int argc, char **argv) {
+    /* Prepare logging early so we can record failures */
+    redirect_to_kmsg();
+
+    if (setup_mounts_and_dev() != 0) {
+        fprintf(stderr, "proxy_main: setup_mounts_and_dev failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        fprintf(stderr, "proxy_main: socketpair failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "proxy_main: fork failed: %s\n", strerror(errno));
+        close(sv[0]); close(sv[1]);
+        return 1;
+    }
+
+    if (pid > 0) {
+        /* Parent: close child end and return success (background service started) */
+        close(sv[1]);
+        /* Optionally log the background PID */
+        fprintf(stderr, "proxy_main: background proxy started pid=%d\n", pid);
+        return 0;
+    }
+
+    /* Child: become the background proxy process */
+    close(sv[0]);
+
+    /* Detach: new session, optional chdir, reset umask */
+    if (setsid() < 0) {
+        /* non-fatal */
+    }
+    chdir("/");
+    umask(0);
+
+    /* Close all fds except sv[1], STDIN/OUT/ERR if desired.
+     * Use sysconf to get max fd limit.
+     */
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0) maxfd = 256;
+    for (int fd = 3; fd < (int)maxfd; fd++) {
+        if (fd == sv[1]) continue;
+        close(fd);
+    }
+
+    /* Ensure logging is attached to kmsg in the daemon child */
+    redirect_to_kmsg();
+
+    /* Run the proxy loop on the socket end; proxy_loop should not return under normal operation.
+     * If it returns, exit with its return code.
+     */
+    int rc = proxy_loop(sv[1]);
+    _exit(rc);
+}
+
+/* -------------------------
+ * child_main: console-bound exec
+ * ------------------------- */
+
+/* child_main receives argc/argv where argv[0] is the program to exec.
+ * It binds stdio to the console (from cmdline or /dev/console) and execs the program.
+ */
+int child_main(int argc, char **argv) {
+    const char *tty = parse_console_from_cmdline();
+    if (!tty) tty = "/dev/console";
+
+    if (redirect_to_console(tty) < 0) {
+        /* If console redirect fails, try /dev/console as a last resort */
+        redirect_to_console("/dev/console");
+    }
+
+    if (argc < 1 || !argv[0]) {
+        fprintf(stderr, "child_main: no command provided\n");
+        return 1;
+    }
+
+    if (!validate_command(argv[0])) {
+        fprintf(stderr, "child_main: command not found or not executable: %s\n", argv[0]);
+        return 1;
+    }
+
+    execvp(argv[0], argv);
+    /* If execvp returns, it failed */
+    fprintf(stderr, "child_main: execvp failed: %s\n", strerror(errno));
+    return 1;
 }
