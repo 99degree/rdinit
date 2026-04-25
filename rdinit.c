@@ -694,7 +694,7 @@ static int cmd_ns_su(int argc, char *argv[])
     }
     char *child_argv[MAX_ARGS];
     int  n = 0;
-    for (int i = 2; i < argc && n < MAX_ARGS - 1; ++i)
+    for (int i = 1; i < argc && n < MAX_ARGS - 1; ++i)
         child_argv[n++] = argv[i];
     child_argv[n] = NULL;
 
