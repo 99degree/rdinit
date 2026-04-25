@@ -470,7 +470,19 @@ static void mount_proc(void)
 /* Create a tiny /dev (tmpfs) and the essential character devices. */
 static void mount_dev(bool use_devtmpfs)
 {
-    if (use_devtmpfs) {
+    struct stat st;
+
+    /* Ensure /proc directory exists */
+    if (stat("/proc", &st) != 0) {
+      if (mkdir("/proc", 0555) < 0 && errno != EEXIST) {
+          LOG_ERR("mkdir /proc failed: %s", strerror(errno));
+          return;
+      }
+    }
+
+    if (debug_mode) {
+        LOG("mount_dev: skipping in debug mode");
+    } else if (use_devtmpfs) {
         if (mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755") < 0)
             LOG_ERR("mount devtmpfs failed: %s", strerror(errno));
     } else {
@@ -495,22 +507,14 @@ static void setup_mount_namespace(void) {
   LOG("setup_mount_namespace: skipping in debug mode");
   return;
  }
-#ifdef NO_UNSHARE
- LOG("skip unshare - test mode");
-#else
+
  /* Create PID namespace FIRST to avoid EINVAL issues with mount namespace */
- if (unshare(CLONE_NEWPID) < 0) {
+ if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
   LOG_ERR("unshare(CLONE_NEWPID) failed: %s", strerror(errno));
  } else {
-  LOG("unshared PID namespace - now running as PID %d inside", getpid());
+  LOG("unshared PID/MOUNT namespace - now running as PID %d inside", getpid());
  }
- 
- if (unshare(CLONE_NEWNS) < 0) {
-  LOG_ERR("unshare(CLONE_NEWNS) failed: %s", strerror(errno));
- } else {
-  LOG("unshared mount namespace");
- }
-#endif
+
  if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0) {
   LOG_ERR("remount / private failed: %s", strerror(errno));
  } else {
@@ -545,8 +549,11 @@ static void redirect_to_kmsg(void)
         LOG_ERR("cannot open /dev/kmsg: %s", strerror(errno));
         return;
     }
-    dup2(fd, STDOUT_FILENO);
-    dup2(fd, STDERR_FILENO);
+
+    if (!debug_mode) {
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+    }
     kmsg_fd = fd;
 }
 
@@ -579,15 +586,12 @@ static pid_t spawn_common(int mode,
 
         switch (mode) {
         case MODE_PROXY:
- LOG("child entering proxy mode");
- if (!debug_mode) {
-  setup_mount_namespace();
-  mount_dev(false);
-  redirect_to_kmsg();
- } else {
-  LOG("Skipping setup in debug mode for proxy");
- }
- proxy_loop();          /* never returns */
+            LOG("child entering proxy mode");
+            setup_mount_namespace();
+            mount_dev(false);
+            redirect_to_kmsg();
+
+            proxy_loop();          /* never returns */
             _exit(0);
 
         case MODE_NS_SU:
