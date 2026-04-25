@@ -363,8 +363,17 @@ static void proxy_loop(void)
     memcpy(&addr.sun_path[1], ABSTRACT_SOCK_NAME, n);
     socklen_t addrlen = offsetof(struct sockaddr_un, sun_path) + 1 + n;
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, addrlen) < 0)
-        abort_msg("bind() failed");
+    /* Retry bind with exponential backoff */
+    int bind_retries = 5;
+    while (bind_retries--) {
+        if (bind(listen_fd, (struct sockaddr *)&addr, addrlen) == 0)
+            break;
+        if (bind_retries == 0) {
+            abort_msg("bind() failed");
+        }
+        LOG("bind() failed, retrying in 2 seconds...");
+        sleep(2);
+    }
 
     if (listen(listen_fd, 5) < 0)
         abort_msg("listen() failed");
@@ -678,10 +687,18 @@ static pid_t send_proxy_request(const char *tag,
     memcpy(&addr.sun_path[1], ABSTRACT_SOCK_NAME, n);
     socklen_t addrlen = offsetof(struct sockaddr_un, sun_path) + 1 + n;
 
-    if (connect(fd, (struct sockaddr *)&addr, addrlen) < 0) {
-        LOG_ERR("connect() to proxy failed: %s", strerror(errno));
-        close(fd);
-        return -1;
+    /* Retry connect with exponential backoff */
+    int connect_retries = 5;
+    while (connect_retries--) {
+        if (connect(fd, (struct sockaddr *)&addr, addrlen) == 0)
+            break;
+        if (connect_retries == 0) {
+            LOG_ERR("connect() to proxy failed: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        LOG("connect() failed, retrying in 2 seconds...");
+        sleep(2);
     }
 
     if (tlv_send(fd, TLV_TAG, tag) < 0)       goto fail;
@@ -807,9 +824,17 @@ char *init_path = find_init_path(NULL);
     /* Ask the proxy to run the init inside a fresh chroot (root = "./") */
     const char *tty_path3 = ttyname(STDOUT_FILENO);
     if (!tty_path3) tty_path3 = "/dev/tty";
-    pid_t child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1, tty_path3);
-    if (child < 0)
-        LOG_ERR("failed to launch init via proxy");
+    for (int try = 0; try < 5; try++) {
+        pid_t child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1, tty_path3);
+        if (child < 0) {
+            LOG_ERR("failed to launch init via proxy");
+            if (try < 4) {  // Don't sleep on the last attempt
+                sleep(2);  // 2 second delay
+            }
+            continue;
+        }
+        break;
+    }
 
     free(init_path);
 
