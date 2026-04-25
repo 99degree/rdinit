@@ -450,10 +450,21 @@ static void proxy_loop(void)
  *-----------------------------------------------------------------------*/
 static void mount_proc(void)
 {
-    if (mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV, NULL) < 0)
-        LOG_ERR("mount /proc failed: %s", strerror(errno));
-    else
-        LOG("mounted /proc");
+ struct stat st;
+
+ /* Ensure /proc directory exists */
+ if (stat("/proc", &st) != 0) {
+  if (mkdir("/proc", 0555) < 0 && errno != EEXIST) {
+   LOG_ERR("mkdir /proc failed: %s", strerror(errno));
+   return;
+  }
+ }
+
+ /* Mount /proc */
+ if (mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV, NULL) < 0)
+  LOG_ERR("mount /proc failed: %s", strerror(errno));
+ else
+  LOG("mounted /proc");
 }
 
 /* Create a tiny /dev (tmpfs) and the essential character devices. */
@@ -479,26 +490,44 @@ static void mount_dev(bool use_devtmpfs)
 }
 
 /* Perform the common mount-namespace setup (called by both init and proxy). */
-static void setup_mount_namespace(void)
-{
+static void setup_mount_namespace(void) {
 #ifdef NO_UNSHARE
-    LOG("skip unshare(CLONE_NEWNS) - test mode");
+ LOG("skip unshare - test mode");
 #else
-    if (unshare(CLONE_NEWNS) < 0)
-        LOG_ERR("unshare(CLONE_NEWNS) failed: %s", strerror(errno));
-    else
-        LOG("unshared mount namespace");
+ if (unshare(CLONE_NEWNS) < 0) {
+  LOG_ERR("unshare(CLONE_NEWNS) failed: %s", strerror(errno));
+ } else {
+  LOG("unshared mount namespace");
+ }
+ 
+ if (unshare(CLONE_NEWPID) < 0) {
+  LOG_ERR("unshare(CLONE_NEWPID) failed: %s", strerror(errno));
+ } else {
+  LOG("unshared PID namespace - now running as PID %d inside", getpid());
+ }
 #endif
+ if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0) {
+  LOG_ERR("remount / private failed: %s", strerror(errno));
+ } else {
+  LOG("remounted / as private");
+ }
 
-    if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
-        LOG_ERR("remount / private failed: %s", strerror(errno));
-    else
-        LOG("remounted / as private");
+ /* Ensure essential directories exist */
+ struct stat st;
+ if (stat("/dev", &st) != 0) {
+  if (mkdir("/dev", 0755) < 0 && errno != EEXIST)
+   LOG_ERR("mkdir /dev failed: %s", strerror(errno));
+ }
+ if (stat("/proc", &st) != 0) {
+  if (mkdir("/proc", 0755) < 0 && errno != EEXIST)
+   LOG_ERR("mkdir /proc failed: %s", strerror(errno));
+ }
+ if (stat("/sys", &st) != 0) {
+  if (mkdir("/sys", 0755) < 0 && errno != EEXIST)
+   LOG_ERR("mkdir /sys failed: %s", strerror(errno));
+ }
 
-    mkdir("/dev", 0755);
-    mkdir("/proc", 0755);
-    mkdir("/sys", 0755);   /* we do not mount sysfs, but the dir is useful */
-    mount_proc();
+ mount_proc();
 }
 
 /*-----------------------------------------------------------------------
@@ -699,7 +728,8 @@ static int cmd_ns_chroot(int argc, char *argv[], bool use_devtmpfs)
 static int rdinit_main(void)
 {
     set_log_prefix("rdinit");
-    LOG("starting as PID 1");
+ pid_t original_pid = getpid();
+ LOG("starting (original PID %d)", original_pid);
 
     /* Minimal mount namespace + /dev, /proc */
     setup_mount_namespace();
@@ -717,7 +747,8 @@ static int rdinit_main(void)
      *  Find the init binary (respecting cmdline "init=" first, then fall-
      *  backs).  The helper returns a malloc'ed string that we must free.
      * ----------------------------------------------------------------- */
-    char *init_path = find_init_path(NULL);
+      if (original_pid == 1) {
+char *init_path = find_init_path(NULL);
     if (!init_path) {
         LOG_ERR("no usable init binary found - giving up");
         abort_msg("no init");
@@ -738,7 +769,34 @@ static int rdinit_main(void)
 
     free(init_path);
 
-    /* --------------------------------------------------------------
+      } else {
+    LOG("Not running as original PID 1. Proxy started. Waiting for external commands...");
+    setup_signal_handlers();
+    while (1) {
+      int status;
+      pid_t w = wait(&status);
+      if (w > 0) {
+        if (WIFEXITED(status)) LOG("child %d exited with %d", w, WEXITSTATUS(status));
+        else if (WIFSIGNALED(status)) LOG("child %d killed by signal %d", w, WTERMSIG(status));
+        if (w == proxy) {
+          LOG("proxy died, exiting");
+          return 1;
+        }
+      } else if (w < 0) {
+        if (errno == ECHILD) {
+          while (!child_exited) pause();
+          child_exited = 0;
+        } else if (errno != EINTR) {
+          LOG_ERR("wait() failed: %s", strerror(errno));
+        }
+      }
+    }
+    return 0;
+  }
+
+  /* --------------------------------------------------------------
+   * Reap children forever. Using wait() with signal handler.
+   * -------------------------------------------------------------- *//* --------------------------------------------------------------
      *  Reap children forever.  Using wait() with signal handler.
      * -------------------------------------------------------------- */
     setup_signal_handlers();
