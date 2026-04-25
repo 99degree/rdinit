@@ -339,7 +339,7 @@ enum {
 static pid_t spawn_common(int mode,
                           const char *newroot,
                           const char *oldroot,
-                          char **argv);
+                          char **argv, const char *tty_path);
 
 /* -------------------------------------------------------------
  *  proxy_loop()
@@ -382,7 +382,7 @@ static void proxy_loop(void)
          *  Parse the incoming TLV stream.
          *  The protocol is tiny, so we keep everything on the stack.
          * ---------------------------------------------------------------- */
-        char *tag = NULL, *newroot = NULL, *oldroot = NULL;
+        char *tag = NULL, *newroot = NULL, *oldroot = NULL, *tty_path = NULL;
         char *argv[MAX_ARGS];
         int   argc = 0;
         bool  end_seen = false;
@@ -396,7 +396,7 @@ static void proxy_loop(void)
             case TLV_TAG:    tag = val;    break;
             case TLV_NEWROOT:newroot = val;break;
             case TLV_OLDROOT:oldroot = val;break;
-            case TLV_TTY:    /* ignored by this proxy - kept for compatibility */ free(val); break;
+            case TLV_TTY: tty_path = val; break;
             case TLV_ARG:
                 if (argc < MAX_ARGS - 1) argv[argc++] = val;
                 else { free(val); LOG_ERR("too many arguments"); }
@@ -426,7 +426,7 @@ static void proxy_loop(void)
 
         pid_t child = -1;
         if (mode > 0) {
-            child = spawn_common(mode, newroot, oldroot, argv);
+            child = spawn_common(mode, newroot, oldroot, argv, tty_path);
             LOG("spawn_common returned pid %d (mode=%d)", child, mode);
         } else {
             LOG_ERR("invalid or missing TAG TLV: %s", tag ? tag : "(null)");
@@ -569,7 +569,8 @@ static void redirect_to_kmsg(void)
 static pid_t spawn_common(int mode,
                           const char *newroot,
                           const char *oldroot,  /* reserved for future use */
-                          char **argv)
+                          char **argv,
+                          const char *tty_path)
 {
     (void)oldroot;  /* currently unused, reserved for future use */
     pid_t pid = fork();
@@ -594,13 +595,32 @@ static pid_t spawn_common(int mode,
             proxy_loop();          /* never returns */
             _exit(0);
 
-        case MODE_NS_SU:
+        case MODE_NS_SU: {
+            if (tty_path && tty_path[0]) {
+                int tty_fd = open(tty_path, O_RDWR);
+                if (tty_fd >= 0) {
+                    dup2(tty_fd, STDIN_FILENO);
+                    dup2(tty_fd, STDOUT_FILENO);
+                    dup2(tty_fd, STDERR_FILENO);
+                    close(tty_fd);
+                }
+            }
             LOG("child executing %s (su mode)", argv[0] ? argv[0] : "(null)");
             execvp(argv[0], argv);
             LOG_ERR("execvp %s failed: %s", argv[0], strerror(errno));
             _exit(127);
+        }
 
-        case MODE_NS_CHROOT:
+        case MODE_NS_CHROOT: {
+            if (tty_path && tty_path[0]) {
+                int tty_fd = open(tty_path, O_RDWR);
+                if (tty_fd >= 0) {
+                    dup2(tty_fd, STDIN_FILENO);
+                    dup2(tty_fd, STDOUT_FILENO);
+                    dup2(tty_fd, STDERR_FILENO);
+                    close(tty_fd);
+                }
+            }
             LOG("child chroot to %s", newroot);
             if (chdir(newroot) < 0) {
                 LOG_ERR("chdir(%s) failed: %s", newroot, strerror(errno));
@@ -613,6 +633,7 @@ static pid_t spawn_common(int mode,
             execvp(argv[0], argv);
             LOG_ERR("execvp %s failed: %s", argv[0], strerror(errno));
             _exit(127);
+        }
 
         case MODE_NS_CHROOT_DEVTMPFS:
             LOG("child entering chroot+devtmpfs mode");
@@ -758,7 +779,7 @@ static int rdinit_main(void)
  }
 
  /* Spawn the proxy that will later run the real init */
-    pid_t proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL);
+    pid_t proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL, NULL);
     if (proxy < 0)
         abort_msg("failed to start proxy");
 
