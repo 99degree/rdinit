@@ -642,7 +642,8 @@ static pid_t send_proxy_request(const char *tag,
                                 const char *newroot,
                                 const char *oldroot,
                                 char **argv,
-                                int argc)
+                                int argc,
+    const char *tty_path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -698,7 +699,9 @@ static int cmd_ns_su(int argc, char *argv[])
         child_argv[n++] = argv[i];
     child_argv[n] = NULL;
 
-    pid_t child = send_proxy_request("NS_SU", NULL, NULL, child_argv, n);
+    const char *tty_path = ttyname(STDOUT_FILENO);
+ if (!tty_path) tty_path = "/dev/tty";
+ pid_t child = send_proxy_request("NS_SU", NULL, NULL, child_argv, n, tty_path);
     if (child < 0) {
         fprintf(stderr, "ns-su failed\n");
         return 1;
@@ -724,7 +727,9 @@ static int cmd_ns_chroot(int argc, char *argv[], bool use_devtmpfs)
     child_argv[n] = NULL;
 
     const char *tag = use_devtmpfs ? "NS_CHROOT_DEVTMPFS" : "NS_CHROOT";
-    pid_t child = send_proxy_request(tag, root, "oldroot", child_argv, n);
+    const char *tty_path2 = ttyname(STDOUT_FILENO);
+    if (!tty_path2) tty_path2 = "/dev/tty";
+    pid_t child = send_proxy_request(tag, root, "oldroot", child_argv, n, tty_path2);
     if (child < 0) {
         fprintf(stderr, "ns-chroot failed\n");
         return 1;
@@ -779,7 +784,9 @@ char *init_path = find_init_path(NULL);
     child_argv[3] = NULL;
 
     /* Ask the proxy to run the init inside a fresh chroot (root = "./") */
-    pid_t child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1);
+    const char *tty_path3 = ttyname(STDOUT_FILENO);
+    if (!tty_path3) tty_path3 = "/dev/tty";
+    pid_t child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1, tty_path3);
     if (child < 0)
         LOG_ERR("failed to launch init via proxy");
 
