@@ -491,19 +491,24 @@ static void mount_dev(bool use_devtmpfs)
 
 /* Perform the common mount-namespace setup (called by both init and proxy). */
 static void setup_mount_namespace(void) {
+ if (debug_mode) {
+  LOG("setup_mount_namespace: skipping in debug mode");
+  return;
+ }
 #ifdef NO_UNSHARE
  LOG("skip unshare - test mode");
 #else
- if (unshare(CLONE_NEWNS) < 0) {
-  LOG_ERR("unshare(CLONE_NEWNS) failed: %s", strerror(errno));
- } else {
-  LOG("unshared mount namespace");
- }
- 
+ /* Create PID namespace FIRST to avoid EINVAL issues with mount namespace */
  if (unshare(CLONE_NEWPID) < 0) {
   LOG_ERR("unshare(CLONE_NEWPID) failed: %s", strerror(errno));
  } else {
   LOG("unshared PID namespace - now running as PID %d inside", getpid());
+ }
+ 
+ if (unshare(CLONE_NEWNS) < 0) {
+  LOG_ERR("unshare(CLONE_NEWNS) failed: %s", strerror(errno));
+ } else {
+  LOG("unshared mount namespace");
  }
 #endif
  if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0) {
@@ -574,11 +579,15 @@ static pid_t spawn_common(int mode,
 
         switch (mode) {
         case MODE_PROXY:
-            LOG("child entering proxy mode");
-            setup_mount_namespace();
-            mount_dev(false);
-            redirect_to_kmsg();
-            proxy_loop();          /* never returns */
+ LOG("child entering proxy mode");
+ if (!debug_mode) {
+  setup_mount_namespace();
+  mount_dev(false);
+  redirect_to_kmsg();
+ } else {
+  LOG("Skipping setup in debug mode for proxy");
+ }
+ proxy_loop();          /* never returns */
             _exit(0);
 
         case MODE_NS_SU:
@@ -606,8 +615,7 @@ static pid_t spawn_common(int mode,
             if (unshare(CLONE_NEWPID) < 0) {
                 LOG_ERR("unshare(CLONE_NEWPID) failed: %s", strerror(errno));
                 _exit(1);
-            }
-            setup_mount_namespace();
+            } if (!debug_mode) setup_mount_namespace(); else LOG("Skipping setup_mount_namespace in debug mode");
             mount_dev(true);      /* devtmpfs this time */
             if (!argv[1]) {
                 LOG_ERR("no binary supplied for chroot-devtmpfs mode");
@@ -732,11 +740,15 @@ static int rdinit_main(void)
  LOG("starting (original PID %d)", original_pid);
 
     /* Minimal mount namespace + /dev, /proc */
-    setup_mount_namespace();
-    mount_dev(false);
-    redirect_to_kmsg();
+ if (!debug_mode) {
+  setup_mount_namespace();
+  mount_dev(false);
+  redirect_to_kmsg();
+ } else {
+  LOG("Skipping setup in debug mode");
+ }
 
-    /* Spawn the proxy that will later run the real init */
+ /* Spawn the proxy that will later run the real init */
     pid_t proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL);
     if (proxy < 0)
         abort_msg("failed to start proxy");
