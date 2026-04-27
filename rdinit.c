@@ -17,6 +17,14 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
+// Forward declaration
+static pid_t send_proxy_request(const char *tag,
+                           const char *newroot,
+                           const char *oldroot,
+                           char **argv,
+                           int argc,
+                           const char *tty_path);
+
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -377,6 +385,34 @@ static void proxy_loop(void)
 
     if (listen(listen_fd, 5) < 0)
         abort_msg("listen() failed");
+
+    // Auto-spawn init if we're the first process
+    // Try to find and spawn init automatically
+    char *init_path = find_init_path(NULL);
+    if (init_path) {
+        LOG("Auto-spawning init: %s", init_path);
+        
+        // Build a tiny argv list:  ["ns-chroot", "./", <init>, NULL]
+        char *child_argv[5];
+        child_argv[0] = "ns-chroot";
+        child_argv[1] = "./";
+        child_argv[2] = init_path;
+        child_argv[3] = NULL;
+
+        // Ask the proxy to run the init inside a fresh chroot (root = "./")
+        const char *tty_path = ttyname(STDOUT_FILENO);
+        if (!tty_path) tty_path = "/dev/tty";
+        pid_t child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1, tty_path);
+        if (child < 0) {
+            LOG_ERR("failed to auto-launch init via proxy");
+        } else {
+            LOG("Auto-spawned init with pid %d", child);
+        }
+        
+        free(init_path);
+    } else {
+        LOG_ERR("no usable init binary found for auto-spawn");
+    }
 
     while (1) {
         LOG("waiting for client");
@@ -824,43 +860,29 @@ char *init_path = find_init_path(NULL);
     /* Ask the proxy to run the init inside a fresh chroot (root = "./") */
     const char *tty_path3 = ttyname(STDOUT_FILENO);
     if (!tty_path3) tty_path3 = "/dev/tty";
+    
+    pid_t init_child = -1;
     for (int try = 0; try < 5; try++) {
-        pid_t child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1, tty_path3);
-        if (child < 0) {
-            LOG_ERR("failed to launch init via proxy");
-            if (try < 4) {  // Don't sleep on the last attempt
-                sleep(2);  // 2 second delay
-            }
-            continue;
+        init_child = send_proxy_request("NS_CHROOT", "./", NULL, &child_argv[2], 1, tty_path3);
+        if (init_child > 0) {
+            LOG("Successfully spawned init (pid %d)", init_child);
+            break;
         }
-        break;
+        LOG_ERR("failed to launch init via proxy, try %d", try);
+        if (try < 4) {
+            sleep(2);
+        }
+    }
+
+    if (init_child <= 0) {
+        LOG_ERR("Failed to spawn init after 5 attempts");
+        abort_msg("cannot spawn init");
     }
 
     free(init_path);
 
       } else {
     LOG("Not running as original PID 1. Proxy started. Waiting for external commands...");
-    setup_signal_handlers();
-    while (1) {
-      int status;
-      pid_t w = wait(&status);
-      if (w > 0) {
-        if (WIFEXITED(status)) LOG("child %d exited with %d", w, WEXITSTATUS(status));
-        else if (WIFSIGNALED(status)) LOG("child %d killed by signal %d", w, WTERMSIG(status));
-        if (w == proxy) {
-          LOG("proxy died, exiting");
-          return 1;
-        }
-      } else if (w < 0) {
-        if (errno == ECHILD) {
-          while (!child_exited) pause();
-          child_exited = 0;
-        } else if (errno != EINTR) {
-          LOG_ERR("wait() failed: %s", strerror(errno));
-        }
-      }
-    }
-    return 0;
   }
 
   /* --------------------------------------------------------------
@@ -869,6 +891,8 @@ char *init_path = find_init_path(NULL);
      *  Reap children forever.  Using wait() with signal handler.
      * -------------------------------------------------------------- */
     setup_signal_handlers();
+    
+    /* Main monitoring loop - only restarts services if they die */
     while (1) {
         int status;
         pid_t w = wait(&status);
@@ -877,17 +901,28 @@ char *init_path = find_init_path(NULL);
                 LOG("child %d exited with %d", w, WEXITSTATUS(status));
             else if (WIFSIGNALED(status))
                 LOG("child %d killed by signal %d", w, WTERMSIG(status));
+
+            /* Only restart the proxy if it dies */
+            if (w == proxy) {
+                LOG("proxy died, restarting");
+                proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL, NULL);
+                if (proxy < 0) {
+                    abort_msg("failed to restart proxy");
+                }
+                LOG("proxy restarted (pid %d)", proxy);
+            }
+            
             child_exited = 0;
         } else if (w < 0) {
             if (errno == ECHILD) {
                 /* No children - wait for signal */
                 while (!child_exited) pause();
                 child_exited = 0;
-            } else if (errno != EINTR)
+            } else if (errno != EINTR) {
                 LOG_ERR("wait() failed: %s", strerror(errno));
+            }
         }
     }
-    return 0;   /* never reached */
 }
 
 /*-----------------------------------------------------------------------
