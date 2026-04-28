@@ -379,7 +379,6 @@ static void proxy_loop(void)
     }
 
     if (listen(listen_fd, 5) < 0)
-    if (listen(listen_fd, 5) < 0)
         abort_msg("listen() failed");
 
     // Auto-spawn init if running as PID 1
@@ -392,7 +391,7 @@ static void proxy_loop(void)
             char *argv[4] = {"ns-chroot", "./", init_path, NULL};
             const char *tty = ttyname(STDOUT_FILENO);
             if (!tty) tty = "/dev/tty";
-            
+
             pid_t init_pid = spawn_common(MODE_NS_CHROOT, "./", NULL, &argv[2], tty);
             if (init_pid > 0) {
                 LOG("Successfully spawned init (pid %d)", init_pid);
@@ -400,6 +399,14 @@ static void proxy_loop(void)
             free(init_path);
         }
     }
+
+    while (1) {
+        LOG("waiting for client");
+        int client = accept(listen_fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERR("accept() failed: %s", strerror(errno));
+            continue;
         }
 
         /* ----------------------------------------------------------------
@@ -821,40 +828,54 @@ static int rdinit_main(void)
      *  Find the init binary (respecting cmdline "init=" first, then fall-
      *  backs).  The helper returns a malloc'ed string that we must free.
      * ----------------------------------------------------------------- */
-      if (original_pid == 1) {
-char *init_path = find_init_path(NULL);
-    if (!init_path) {
-        LOG_ERR("no usable init binary found - giving up");
-        abort_msg("no init");
-    }
-    LOG("chosen init binary: %s", init_path);
+  if (original_pid == 1) {
+    /* Minimal supervisor - just monitor the proxy */
+    while (1) {
+        int status;
+        pid_t w = waitpid(proxy, &status, WNOHANG);
 
-    /* Build a tiny argv list:  ["ns-chroot", "./", <init>, NULL] */
-    char *child_argv[5];
-    child_argv[0] = "ns-chroot";
-    child_argv[1] = "./";
-    child_argv[2] = init_path;
-    if (original_pid == 1) {
-        /* Minimal supervisor - just monitor the proxy */
-        while (1) {
-            int status;
-            pid_t w = waitpid(proxy, &status, WNOHANG);
+        if (w == proxy) {
+            /* Proxy died */
+            if (WIFEXITED(status))
+                LOG("proxy exited with %d", WEXITSTATUS(status));
+            else if (WIFSIGNALED(status))
+                LOG("proxy killed by signal %d", WTERMSIG(status));
 
-            if (w == proxy) {
-                // Proxy died, restart it
-                LOG("Proxy died, restarting...");
-                proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL, NULL);
-                if (proxy <= 0) {
-                    abort_msg("Cannot continue without proxy");
-                }
-                LOG("Proxy restarted (pid %d)", proxy);
-            } else if (w == 0) {
-                // Nothing happened, sleep to conserve CPU
-                sleep(1);
+            LOG("Restarting proxy...");
+            proxy = spawn_common(MODE_PROXY, NULL, NULL, NULL, NULL);
+            if (proxy <= 0) {
+                LOG_ERR("Failed to restart proxy");
+                abort_msg("Cannot continue without proxy");
+            }
+            LOG("Proxy restarted (pid %d)", proxy);
+        }
+        else if (w == 0) {
+            /* Proxy still running, sleep to conserve CPU */
+            sleep(1);
+        }
+        else {
+            /* Error case */
+            if (errno != ECHILD && errno != EINTR) {
+                LOG_ERR("waitpid() failed: %s", strerror(errno));
             }
         }
-    } else {
-        LOG("Not running as PID 1. Waiting for external commands...");
+    }
+  } else {
+    LOG("Not running as PID 1. Waiting for external commands...");
+    LOG("Not running as original PID 1. Proxy started. Waiting for external commands...");
+  }
+
+  /* --------------------------------------------------------------
+   * Reap children forever. Using wait() with signal handler.
+   * -------------------------------------------------------------- *//* --------------------------------------------------------------
+     *  Reap children forever.  Using wait() with signal handler.
+     * -------------------------------------------------------------- */
+    setup_signal_handlers();
+    while (1) {
+        int status;
+        pid_t w = wait(&status);
+        if (w > 0) {
+            if (WIFEXITED(status))
                 LOG("child %d exited with %d", w, WEXITSTATUS(status));
             else if (WIFSIGNALED(status))
                 LOG("child %d killed by signal %d", w, WTERMSIG(status));
